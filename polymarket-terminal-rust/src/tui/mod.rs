@@ -812,14 +812,13 @@ fn render_active_market(
 ) {
     let ts = am.tick_size;
 
-    // In neg_risk UP-DOWN markets one token has only asks and the other only bids.
-    // Fall back to the NO token when YES is missing a side so both halves are always visible.
+    // Merged market view: derive YES from both YES and NO boards, not just one side.
     let yes_best_bid = ob.best_bid(&am.yes_token_id)
-        .or_else(|| ob.best_bid(&am.no_token_id));
+        .or_else(|| ob.best_ask(&am.no_token_id).map(|a| round_tick(1.0 - a, ts)));
     let yes_best_ask = ob.best_ask(&am.yes_token_id)
-        .or_else(|| ob.best_ask(&am.no_token_id));
+        .or_else(|| ob.best_bid(&am.no_token_id).map(|b| round_tick(1.0 - b, ts)));
 
-    // Synthetic mid: use best_bid if available, else best_ask - 1 tick
+    // Synthetic mid: use merged best_bid if available, else merged best_ask - 1 tick
     let yes_mid = yes_best_bid
         .or_else(|| yes_best_ask.map(|a| round_tick(a - ts, ts)));
 
@@ -907,16 +906,24 @@ fn render_yes_book(
     am: &ActiveMarket,
     marker_price: Option<f64>,
 ) {
-    // In neg_risk UP-DOWN markets YES token has only asks and NO token has only bids
-    // (or vice-versa).  Fall back to the other token so both sides are always rendered.
-    let asks = {
-        let a = ob.top_asks(&am.yes_token_id, 6);
-        if a.is_empty() { ob.top_asks(&am.no_token_id, 6) } else { a }
-    };
-    let bids = {
-        let b = ob.top_bids(&am.yes_token_id, 6);
-        if b.is_empty() { ob.top_bids(&am.no_token_id, 6) } else { b }
-    };
+    // Build a merged YES book from both boards.
+    // Direct YES asks/bids are preferred; if missing, derive them from the opposite NO board.
+    let mut asks = ob.top_asks(&am.yes_token_id, 6);
+    if asks.is_empty() {
+        asks = ob.top_bids(&am.no_token_id, 6)
+            .into_iter()
+            .map(|(p, s)| (round_tick(1.0 - p, am.tick_size), s))
+            .collect();
+        asks.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    }
+    let mut bids = ob.top_bids(&am.yes_token_id, 6);
+    if bids.is_empty() {
+        bids = ob.top_asks(&am.no_token_id, 6)
+            .into_iter()
+            .map(|(p, s)| (round_tick(1.0 - p, am.tick_size), s))
+            .collect();
+        bids.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    }
 
     let max_size: f64 = asks.iter().chain(bids.iter())
         .map(|(_, s)| *s)

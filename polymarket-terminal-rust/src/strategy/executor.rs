@@ -118,13 +118,24 @@ pub async fn run_once(
         let no_best_bid = ob.best_bid(&market.no_token_id);
         let no_ask      = ob.best_ask(&market.no_token_id);
 
-        // In neg_risk UP-DOWN markets the WS often shows ONLY asks for one token
-        // and ONLY bids for the other (YES ask ≈ 1 − NO bid).
-        // Derive a synthetic bid from the ask side when real bids are absent.
-        let yes_mid = yes_best_bid
-            .or_else(|| yes_ask.map(|a| round_tick(a - ts, ts)));
-        let no_mid  = no_best_bid
-            .or_else(|| no_ask.map(|a| round_tick(a - ts, ts)));
+        // Merged market view: infer each side from the opposite board too.
+        // YES value can be seen directly from YES bid/ask, or indirectly from NO ask/bid.
+        // This avoids the "horse blinders" problem where one board looks empty and we
+        // accidentally buy/sell against a stale or one-sided quote.
+        let merged_yes_bid = yes_best_bid
+            .or_else(|| no_ask.map(|a| round_tick(1.0 - a, ts)));
+        let merged_yes_ask = yes_ask
+            .or_else(|| no_best_bid.map(|b| round_tick(1.0 - b, ts)));
+        let merged_no_bid = no_best_bid
+            .or_else(|| yes_ask.map(|a| round_tick(1.0 - a, ts)));
+        let merged_no_ask = no_ask
+            .or_else(|| yes_best_bid.map(|b| round_tick(1.0 - b, ts)));
+
+        // Use a merged fair view, preferring actual bids, otherwise ask-derived values.
+        let yes_mid = merged_yes_bid
+            .or_else(|| merged_yes_ask.map(|a| round_tick(a - ts, ts)));
+        let no_mid  = merged_no_bid
+            .or_else(|| merged_no_ask.map(|a| round_tick(a - ts, ts)));
 
         match (yes_mid, no_mid) {
             (None, _) | (_, None) => {
@@ -141,7 +152,7 @@ pub async fn run_once(
                 } else {
                     info!("⚠️  MakerMM{}: no price data \
                         (yes_bid={:?} yes_ask={:?} no_bid={:?} no_ask={:?})",
-                        tag, yes_best_bid, yes_ask, no_best_bid, no_ask);
+                        tag, merged_yes_bid, merged_yes_ask, merged_no_bid, merged_no_ask);
                 }
                 ob.wait_for_update(&[&market.yes_token_id, &market.no_token_id], poll_dur).await;
                 continue;
@@ -149,14 +160,14 @@ pub async fn run_once(
             (Some(y_mid), Some(n_mid)) => {
                 // Market Chasing Logic: Try to bid at the best bid for both sides
                 let mut y = round_tick(y_mid + ts, ts);
-                if let Some(ask) = yes_ask {
+                if let Some(ask) = merged_yes_ask {
                     if y >= ask - ts {
                         y = round_tick(ask - 2.0 * ts, ts);
                     }
                 }
 
                 let mut n = round_tick(n_mid + ts, ts);
-                if let Some(ask) = no_ask {
+                if let Some(ask) = merged_no_ask {
                     if n >= ask - ts {
                         n = round_tick(ask - 2.0 * ts, ts);
                     }
@@ -188,8 +199,8 @@ pub async fn run_once(
                 }
 
                 let combined = ((y + n) * 10000.0).round() / 10000.0;
-                let yes_src = if yes_best_bid.is_some() { "bid" } else { "ask-derived" };
-                let no_src  = if no_best_bid.is_some() { "bid" } else { "ask-derived" };
+                let yes_src = if yes_best_bid.is_some() { "bid" } else if no_ask.is_some() { "opp-ask-derived" } else { "ask-derived" };
+                let no_src  = if no_best_bid.is_some() { "bid" } else if yes_ask.is_some() { "opp-ask-derived" } else { "ask-derived" };
                 info!("✅ MakerMM{}: ready — YES ${:.4}({}) + NO ${:.4}({}) = ${:.4}",
                     tag, y, yes_src, n, no_src, combined);
                 break (y, n);
